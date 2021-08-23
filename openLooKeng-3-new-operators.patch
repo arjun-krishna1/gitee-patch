@@ -1,0 +1,528 @@
+From 3d4759c686f932a352a08165d947d470d3f8162f Mon Sep 17 00:00:00 2001
+From: arjunkrishna <arjun.krishna@huawei.com>
+Date: Wed, 26 May 2021 15:48:47 -0400
+Subject: [PATCH] add non-inclusive range logic in getPages and unit tests
+
+---
+ .../plugin/memory/data/LogicalPart.java       |  35 +-
+ .../plugin/memory/data/TestLogicalPart.java   | 388 +++++++++++++++++-
+ 2 files changed, 399 insertions(+), 24 deletions(-)
+
+diff --git a/presto-memory/src/main/java/io/prestosql/plugin/memory/data/LogicalPart.java b/presto-memory/src/main/java/io/prestosql/plugin/memory/data/LogicalPart.java
+index 22fe8669..9bdccc70 100644
+--- a/presto-memory/src/main/java/io/prestosql/plugin/memory/data/LogicalPart.java
++++ b/presto-memory/src/main/java/io/prestosql/plugin/memory/data/LogicalPart.java
+@@ -396,7 +396,7 @@ public class LogicalPart
+                     Object lookupValue = getNativeValue(range.getSingleValue());
+                     if (!(lookupValue instanceof Comparable)) {
+                         LOG.warn("Lookup value is not Comparable. Sparse index could not be queried.");
+-                        return pages;
++                        return getPages();
+                     }
+                     result.addAll(indexedPagesMap.getOrDefault(lookupValue, new ArrayList<>()));
+ 
+@@ -420,7 +420,7 @@ public class LogicalPart
+                         // >= or >
+                         if (!(range.getLow().getValue() instanceof Comparable)) {
+                             LOG.warn("Lookup value is not Comparable. Sparse index could not be queried.");
+-                            return pages;
++                            return getPages();
+                         }
+                         low = (Comparable) range.getLow().getValue();
+                         high = (Comparable) indexedPagesMap.lastKey();
+@@ -435,7 +435,7 @@ public class LogicalPart
+                         // <= or <
+                         if (!(range.getHigh().getValue() instanceof Comparable)) {
+                             LOG.warn("Lookup value is not Comparable. Sparse index could not be queried.");
+-                            return pages;
++                            return getPages();
+                         }
+                         low = (Comparable) indexedPagesMap.firstKey();
+                         high = (Comparable) range.getHigh().getValue();
+@@ -448,17 +448,17 @@ public class LogicalPart
+                         }
+                     }
+                     else if (!highBoundless && !lowBoundless) {
+-                        // BETWEEN
++                        // BETWEEN, non-inclusive range < && >
+                         if (!(range.getLow().getValue() instanceof Comparable || range.getHigh().getValue() instanceof Comparable)) {
+                             LOG.warn("Lookup value is not Comparable. Sparse index could not be queried.");
+-                            return pages;
++                            return getPages();
+                         }
+                         low = min((Comparable) range.getHigh().getValue(), (Comparable) range.getLow().getValue());
+                         high = max((Comparable) range.getHigh().getValue(), (Comparable) range.getLow().getValue());
+-                        navigableMap = indexedPagesMap.subMap(low, true, high, true);
++                        navigableMap = indexedPagesMap.subMap(low, fromInclusive, high, toInclusive);
+                     }
+                     else {
+-                        return pages;
++                        return getPages();
+                     }
+ 
+                     for (Map.Entry entry : navigableMap.entrySet()) {
+@@ -480,12 +480,12 @@ public class LogicalPart
+ 
+             List<Page> resultPageList = new ArrayList<>();
+             for (Integer idx : result) {
+-                resultPageList.add(pages.get(idx));
++                resultPageList.add(getPages().get(idx));
+             }
+             return resultPageList;
+         }
+ 
+-        return pages;
++        return getPages();
+     }
+ 
+     private Integer getLowerPageIndex(Comparable lowestInDom, Comparable lowBound, boolean includeLowBound, Comparable highBound, boolean includeHighBound)
+@@ -495,7 +495,7 @@ public class LogicalPart
+             lowerSparseEntry = indexedPagesMap.lowerEntry(lowestInDom);
+         }
+         else {
+-            lowerSparseEntry = indexedPagesMap.lowerEntry(lowBound);
++            lowerSparseEntry = indexedPagesMap.floorEntry(lowBound);
+         }
+ 
+         if (lowerSparseEntry == null) {
+@@ -504,7 +504,7 @@ public class LogicalPart
+ 
+         List<Integer> lowerPages = lowerSparseEntry.getValue();
+         Integer lastPageIdx = lowerPages.get(lowerPages.size() - 1);
+-        Page lastPage = pages.get(lastPageIdx);
++        Page lastPage = getPages().get(lastPageIdx);
+ 
+         Object lastPageLastValue = getNativeValue(types.get(sortChannels.get(0)), lastPage.getBlock(sortChannels.get(0)), lastPage.getPositionCount() - 1);
+         if (!(lastPageLastValue instanceof Comparable)) {
+@@ -513,18 +513,7 @@ public class LogicalPart
+ 
+         int comp = ((Comparable) lastPageLastValue).compareTo(lowBound);
+         if (comp > 0 || (comp == 0 && includeLowBound)) {
+-            boolean meetsUpperBound = true;
+-            if (highBound != null) {
+-                comp = ((Comparable) lastPageLastValue).compareTo(highBound);
+-                boolean withinHighBound = (comp < 0) || (comp == 0 && includeHighBound);
+-                if (!withinHighBound) {
+-                    meetsUpperBound = false;
+-                }
+-            }
+-
+-            if (meetsUpperBound) {
+-                return lastPageIdx;
+-            }
++            return lastPageIdx;
+         }
+ 
+         return null;
+diff --git a/presto-memory/src/test/java/io/prestosql/plugin/memory/data/TestLogicalPart.java b/presto-memory/src/test/java/io/prestosql/plugin/memory/data/TestLogicalPart.java
+index ab26acfc..40bc08e5 100644
+--- a/presto-memory/src/test/java/io/prestosql/plugin/memory/data/TestLogicalPart.java
++++ b/presto-memory/src/test/java/io/prestosql/plugin/memory/data/TestLogicalPart.java
+@@ -1693,10 +1693,35 @@ public class TestLogicalPart
+         assertEquals(result.size(), 1);
+         assertTrue(areListPagesEqual(result, newPages.subList(3, 4)));
+ 
+-        // low and high are within bounds and not in pages, no values between them are in pages
++        // low and high are within bounds and not in pages, no values between them are in pages but could be
+         low = -19L;
+         high = 19L;
+         result = getSparseFilterBetweenResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, newPages.subList(0, 1)));
++
++        low = 21L;
++        high = 29L;
++        result = getSparseFilterBetweenResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, newPages.subList(1, 2)));
++
++        low = 33L;
++        high = 34L;
++        result = getSparseFilterBetweenResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, newPages.subList(2, 3)));
++
++        low = 42L;
++        high = 47L;
++        result = getSparseFilterBetweenResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, newPages.subList(2, 3)));
++
++        // low and high are within bounds and not in pages, no values between them could be in pages
++        low = 51L;
++        high = 59L;
++        result = getSparseFilterBetweenResult(newLogicalPart, low, high);
+         assertEquals(result.size(), 0);
+         assertTrue(areListPagesEqual(result, Collections.emptyList()));
+ 
+@@ -1726,6 +1751,367 @@ public class TestLogicalPart
+         assertTrue(areListPagesEqual(result, newPages.subList(2, 3)));
+     }
+ 
++    private List<Page> getSparseFilterNonInclusiveRangeResult(LogicalPart logicalPart, Long low, Long high)
++    {
++        Domain domain = Domain.create(ValueSet.ofRanges(
++                range(IntegerType.INTEGER, low, false, high, false)),
++                false);
++
++        return logicalPart.getPages(Collections.emptyMap(), Collections.emptyMap(),
++                ImmutableMap.<Integer, Domain>builder().put(0, domain).build());
++    }
++
++    @Test
++    public void testGetPagesSparseNonInclusiveRange()
++    {
++        long[] pageValues = PAGE_VALUES;
++        LogicalPart logicalPart = setupSparseLogicalPart(pageValues);
++
++        long[] newPageValues = {-20L, -20L, 20L, 20L, 20L, 30L, 30L, 40L, 50L, 70L, 70L, 70L};
++        LogicalPart newLogicalPart = setupSparseLogicalPart(newPageValues);
++
++        // 1. no pages
++        List<Page> result = logicalPart.getPages(Collections.emptyMap(), Collections.emptyMap(), Collections.emptyMap());
++        assertEquals(result.size(), 0);
++        assertTrue(areListPagesEqual(result, Collections.emptyList()));
++
++        result = logicalPart.getPages(Collections.emptyMap(), Collections.emptyMap(), Collections.emptyMap());
++        assertEquals(result.size(), 0);
++        assertTrue(areListPagesEqual(result, Collections.emptyList()));
++
++        // setup pages
++        List<Page> pages = buildFourByThreePagesList(pageValues);
++        addFourPages(logicalPart, pages);
++
++        List<Page> newPages = buildFourByThreePagesList(newPageValues);
++        addFourPages(newLogicalPart, newPages);
++
++        // 2. low and high are greater than max
++        long low = 100L;
++        long high = 200L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 0);
++        assertTrue(areListPagesEqual(result, Collections.emptyList()));
++
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 0);
++        assertTrue(areListPagesEqual(result, Collections.emptyList()));
++
++        // 3. low and high are lesser than min
++        low = -200L;
++        high = -100L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 0);
++        assertTrue(areListPagesEqual(result, Collections.emptyList()));
++
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 0);
++        assertTrue(areListPagesEqual(result, Collections.emptyList()));
++
++        // 4. low and high are min and max
++        low = 2L;
++        high = 7L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 2);
++        assertTrue(areListPagesEqual(result, pages.subList(1, 3)));
++
++        low = -20L;
++        high = 70L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 3);
++        assertTrue(areListPagesEqual(result, newPages.subList(0, 3)));
++
++        // 4. low is lower than min, high is max
++        low = -100L;
++        high = 7L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 3);
++        assertTrue(areListPagesEqual(result, pages.subList(0, 3)));
++
++        low = -100L;
++        high = 70L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 3);
++        assertTrue(areListPagesEqual(result, newPages.subList(0, 3)));
++
++        // 5. high is higher than max, low is min
++        low = 2L;
++        high = 100L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 3);
++        assertTrue(areListPagesEqual(result, pages.subList(1, 4)));
++
++        low = -20L;
++        high = 100L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 4);
++        assertTrue(areListPagesEqual(result, newPages));
++
++        // 6. low is within bounds and is a page value, high is greater than max
++        low = 3L;
++        high = 100L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 2);
++        assertTrue(areListPagesEqual(result, pages.subList(2, 4)));
++
++        low = 4L;
++        high = 100L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 2);
++        assertTrue(areListPagesEqual(result, pages.subList(2, 4)));
++
++        low = 5L;
++        high = 100L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, pages.subList(3, 4)));
++
++        low = 20L;
++        high = 100L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 3);
++        assertTrue(areListPagesEqual(result, newPages.subList(1, 4)));
++
++        low = 30L;
++        high = 100L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 2);
++        assertTrue(areListPagesEqual(result, newPages.subList(2, 4)));
++
++        low = 40L;
++        high = 100L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 2);
++        assertTrue(areListPagesEqual(result, newPages.subList(2, 4)));
++
++        low = 50L;
++        high = 100L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, newPages.subList(3, 4)));
++
++        // 7. high is within bounds and is a page value, low is lower than min
++        low = -100L;
++        high = 5L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 3);
++        assertTrue(areListPagesEqual(result, pages.subList(0, 3)));
++
++        low = -100L;
++        high = 4L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 3);
++        assertTrue(areListPagesEqual(result, pages.subList(0, 3)));
++
++        low = -100L;
++        high = 3L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 2);
++        assertTrue(areListPagesEqual(result, pages.subList(0, 2)));
++
++        low = -100L;
++        high = 50L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 3);
++        assertTrue(areListPagesEqual(result, newPages.subList(0, 3)));
++
++        low = -100L;
++        high = 40L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 3);
++        assertTrue(areListPagesEqual(result, newPages.subList(0, 3)));
++
++        low = -100L;
++        high = 30L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 2);
++        assertTrue(areListPagesEqual(result, newPages.subList(0, 2)));
++
++        low = -100L;
++        high = 20L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, newPages.subList(0, 1)));
++
++        // 8. low is within bounds and is a page value, high is max
++        low = 3L;
++        high = 7L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, pages.subList(2, 3)));
++
++        low = 4L;
++        high = 7L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, pages.subList(2, 3)));
++
++        low = 5L;
++        high = 7L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 0);
++        assertTrue(areListPagesEqual(result, Collections.emptyList()));
++
++        low = 20L;
++        high = 70L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 2);
++        assertTrue(areListPagesEqual(result, newPages.subList(1, 3)));
++
++        low = 30L;
++        high = 70L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, newPages.subList(2, 3)));
++
++        low = 40L;
++        high = 70L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, newPages.subList(2, 3)));
++
++        low = 50L;
++        high = 70L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 0);
++        assertTrue(areListPagesEqual(result, Collections.emptyList()));
++
++        // 9. high is a page value, low is min
++        low = 2L;
++        high = 3L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, pages.subList(1, 2)));
++
++        low = 2L;
++        high = 4L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 2);
++        assertTrue(areListPagesEqual(result, pages.subList(1, 3)));
++
++        low = 2L;
++        high = 5L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 2);
++        assertTrue(areListPagesEqual(result, pages.subList(1, 3)));
++
++        low = -20L;
++        high = 20L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, newPages.subList(0, 1)));
++
++        low = -20L;
++        high = 30L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 2);
++        assertTrue(areListPagesEqual(result, newPages.subList(0, 2)));
++
++        low = -20L;
++        high = 40L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 3);
++        assertTrue(areListPagesEqual(result, newPages.subList(0, 3)));
++
++        low = -20L;
++        high = 50L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 3);
++        assertTrue(areListPagesEqual(result, newPages.subList(0, 3)));
++
++        // 9. high is within bounds and is a page value, low is lower than min
++        low = -100L;
++        high = 5L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 3);
++        assertTrue(areListPagesEqual(result, pages.subList(0, 3)));
++
++        low = -100L;
++        high = 4L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 3);
++        assertTrue(areListPagesEqual(result, pages.subList(0, 3)));
++
++        low = -100L;
++        high = 3L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 2);
++        assertTrue(areListPagesEqual(result, pages.subList(0, 2)));
++
++        low = -100L;
++        high = 50L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 3);
++        assertTrue(areListPagesEqual(result, newPages.subList(0, 3)));
++
++        low = -100L;
++        high = 40L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 3);
++        assertTrue(areListPagesEqual(result, newPages.subList(0, 3)));
++
++        low = -100L;
++        high = 30L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 2);
++        assertTrue(areListPagesEqual(result, newPages.subList(0, 2)));
++
++        low = -100L;
++        high = 20L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, newPages.subList(0, 1)));
++
++        //10. low and high are page values, not max or min
++        low = 3L;
++        high = 5L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, pages.subList(2, 3)));
++
++        low = 4L;
++        high = 5L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, pages.subList(2, 3)));
++
++        low = 3L;
++        high = 4L;
++        result = getSparseFilterNonInclusiveRangeResult(logicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, pages.subList(2, 3)));
++
++        low = 20L;
++        high = 50L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 2);
++        assertTrue(areListPagesEqual(result, newPages.subList(1, 3)));
++
++        low = 30L;
++        high = 50L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, newPages.subList(2, 3)));
++
++        low = 40L;
++        high = 50L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, newPages.subList(2, 3)));
++
++        low = 20L;
++        high = 30L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 1);
++        assertTrue(areListPagesEqual(result, newPages.subList(1, 2)));
++
++        low = 20L;
++        high = 40L;
++        result = getSparseFilterNonInclusiveRangeResult(newLogicalPart, low, high);
++        assertEquals(result.size(), 2);
++        assertTrue(areListPagesEqual(result, newPages.subList(1, 3)));
++    }
++
+     static class BlockComparator
+             implements Comparator<long[]>
+     {
+-- 
+Gitee
+
